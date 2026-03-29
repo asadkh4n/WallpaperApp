@@ -20,11 +20,9 @@ jobs:
           mkdir -p app/src/main/java/com/wallpaperapp
           mkdir -p app/src/main/res/layout
           mkdir -p app/src/main/res/values
-          mkdir -p app/src/main/res/drawable
-          mkdir -p .github/workflows
 
           # ── AndroidManifest.xml ──────────────────────────────────────────
-          cat > app/src/main/AndroidManifest.xml << 'MANIFEST'
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="com.wallpaperapp">
@@ -43,6 +41,11 @@ jobs:
                       </intent-filter>
                   </activity>
                   <activity android:name=".SettingsActivity" android:exported="false"/>
+                  <activity
+                      android:name=".CaptureActivity"
+                      android:exported="false"
+                      android:theme="@style/Theme.Transparent"
+                      android:excludeFromRecents="true"/>
                   <receiver android:name=".BootReceiver" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.BOOT_COMPLETED" />
@@ -50,10 +53,10 @@ jobs:
                   </receiver>
               </application>
           </manifest>
-          MANIFEST
+          EOF
 
           # ── MainActivity.kt ──────────────────────────────────────────────
-          cat > app/src/main/java/com/wallpaperapp/MainActivity.kt << 'KOTLIN'
+          cat > app/src/main/java/com/wallpaperapp/MainActivity.kt << 'EOF'
           package com.wallpaperapp
           import android.content.Intent
           import android.os.Bundle
@@ -72,16 +75,18 @@ jobs:
                   }
                   val statusText = findViewById<TextView>(R.id.statusText)
                   findViewById<Button>(R.id.updateNowButton).setOnClickListener {
-                      WorkManager.getInstance(this).enqueue(OneTimeWorkRequestBuilder<WallpaperWorker>().build())
-                      statusText.text = "⏳ Update triggered — give it a moment!"
+                      startActivity(Intent(this, CaptureActivity::class.java))
+                      statusText.text = "⏳ Capturing page — wallpaper will update shortly!"
                   }
                   scheduleDailyUpdate()
               }
               override fun onResume() {
                   super.onResume()
                   val prefs = getSharedPreferences("WallpaperPrefs", MODE_PRIVATE)
-                  findViewById<TextView>(R.id.urlText).text = prefs.getString("url", "https://www.google.com")
-                  findViewById<TextView>(R.id.lastUpdatedText).text = "Last updated: ${prefs.getString("last_updated", "Never")}"
+                  findViewById<TextView>(R.id.urlText).text =
+                      prefs.getString("url", "https://www.google.com")
+                  findViewById<TextView>(R.id.lastUpdatedText).text =
+                      "Last updated: ${prefs.getString("last_updated", "Never")}"
               }
               private fun scheduleDailyUpdate() {
                   val now = Calendar.getInstance()
@@ -92,15 +97,152 @@ jobs:
                   }
                   val req = PeriodicWorkRequestBuilder<WallpaperWorker>(24, TimeUnit.HOURS)
                       .setInitialDelay(target.timeInMillis - now.timeInMillis, TimeUnit.MILLISECONDS)
-                      .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                      .build()
-                  WorkManager.getInstance(this).enqueueUniquePeriodicWork("DailyWallpaper", ExistingPeriodicWorkPolicy.UPDATE, req)
+                      .setConstraints(
+                          Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+                      ).build()
+                  WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                      "DailyWallpaper", ExistingPeriodicWorkPolicy.UPDATE, req
+                  )
               }
           }
-          KOTLIN
+          EOF
+
+          # ── CaptureActivity.kt ───────────────────────────────────────────
+          # This is the key fix: a real window so WebView renders properly,
+          # then PixelCopy captures it accurately, then the activity finishes.
+          cat > app/src/main/java/com/wallpaperapp/CaptureActivity.kt << 'EOF'
+          package com.wallpaperapp
+          import android.app.WallpaperManager
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.PixelFormat
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.Log
+          import android.view.ViewTreeObserver
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Toast
+          import androidx.annotation.RequiresApi
+          import androidx.appcompat.app.AppCompatActivity
+          import java.text.SimpleDateFormat
+          import java.util.*
+          import android.view.PixelCopy
+
+          class CaptureActivity : AppCompatActivity() {
+              private lateinit var webView: WebView
+              private val handler = Handler(Looper.getMainLooper())
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_capture)
+                  webView = findViewById(R.id.captureWebView)
+                  webView.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      loadWithOverviewMode = true
+                      useWideViewPort = true
+                  }
+                  val prefs = getSharedPreferences("WallpaperPrefs", Context.MODE_PRIVATE)
+                  val url = prefs.getString("url", "https://www.google.com") ?: "https://www.google.com"
+                  webView.webViewClient = object : WebViewClient() {
+                      override fun onPageFinished(view: WebView, url: String) {
+                          // Wait for JS/layout to settle, then capture
+                          handler.postDelayed({ captureAndSetWallpaper() }, 3500)
+                      }
+                      override fun onReceivedError(
+                          view: WebView, request: WebResourceRequest, error: WebResourceError
+                      ) {
+                          if (request.isForMainFrame) {
+                              Toast.makeText(this@CaptureActivity,
+                                  "Failed to load page: ${error.description}", Toast.LENGTH_LONG).show()
+                              finish()
+                          }
+                      }
+                  }
+                  webView.loadUrl(url)
+              }
+
+              private fun captureAndSetWallpaper() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      captureWithPixelCopy()
+                  } else {
+                      captureWithDraw()
+                  }
+              }
+
+              @RequiresApi(Build.VERSION_CODES.O)
+              private fun captureWithPixelCopy() {
+                  val bitmap = Bitmap.createBitmap(webView.width, webView.height, Bitmap.Config.ARGB_8888)
+                  PixelCopy.request(window, bitmap, { result ->
+                      if (result == PixelCopy.SUCCESS) {
+                          applyWallpaper(bitmap)
+                      } else {
+                          Log.w("Capture", "PixelCopy failed ($result), falling back to draw()")
+                          captureWithDraw()
+                      }
+                  }, handler)
+              }
+
+              private fun captureWithDraw() {
+                  try {
+                      webView.isDrawingCacheEnabled = true
+                      val bitmap = Bitmap.createBitmap(webView.drawingCache)
+                      webView.isDrawingCacheEnabled = false
+                      applyWallpaper(bitmap)
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Capture failed: ${e.message}", Toast.LENGTH_LONG).show()
+                      finish()
+                  }
+              }
+
+              private fun applyWallpaper(bitmap: Bitmap) {
+                  try {
+                      WallpaperManager.getInstance(this).setBitmap(bitmap)
+                      val ts = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault()).format(Date())
+                      getSharedPreferences("WallpaperPrefs", Context.MODE_PRIVATE)
+                          .edit().putString("last_updated", ts).apply()
+                      Toast.makeText(this, "✅ Wallpaper updated!", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Failed to set wallpaper: ${e.message}", Toast.LENGTH_LONG).show()
+                  } finally {
+                      finish()
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  handler.removeCallbacksAndMessages(null)
+                  webView.destroy()
+              }
+          }
+          EOF
+
+          # ── WallpaperWorker.kt (for scheduled 1am job) ───────────────────
+          # Launches CaptureActivity so it also has a real window
+          cat > app/src/main/java/com/wallpaperapp/WallpaperWorker.kt << 'EOF'
+          package com.wallpaperapp
+          import android.content.Context
+          import android.content.Intent
+          import androidx.work.Worker
+          import androidx.work.WorkerParameters
+          class WallpaperWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+              override fun doWork(): Result {
+                  val intent = Intent(applicationContext, CaptureActivity::class.java).apply {
+                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  }
+                  applicationContext.startActivity(intent)
+                  return Result.success()
+              }
+          }
+          EOF
 
           # ── SettingsActivity.kt ──────────────────────────────────────────
-          cat > app/src/main/java/com/wallpaperapp/SettingsActivity.kt << 'KOTLIN'
+          cat > app/src/main/java/com/wallpaperapp/SettingsActivity.kt << 'EOF'
           package com.wallpaperapp
           import android.os.Bundle
           import android.widget.Button
@@ -118,79 +260,24 @@ jobs:
                   urlInput.setText(prefs.getString("url", "https://www.google.com"))
                   findViewById<Button>(R.id.saveButton).setOnClickListener {
                       var url = urlInput.text.toString().trim()
-                      if (url.isEmpty()) { Toast.makeText(this, "Please enter a URL", Toast.LENGTH_SHORT).show(); return@setOnClickListener }
+                      if (url.isEmpty()) {
+                          Toast.makeText(this, "Please enter a URL", Toast.LENGTH_SHORT).show()
+                          return@setOnClickListener
+                      }
                       if (!url.startsWith("http")) url = "https://$url"
                       prefs.edit().putString("url", url).apply()
                       Toast.makeText(this, "✅ URL saved!", Toast.LENGTH_SHORT).show()
                       finish()
                   }
               }
-              override fun onSupportNavigateUp(): Boolean { onBackPressedDispatcher.onBackPressed(); return true }
-          }
-          KOTLIN
-
-          # ── WallpaperWorker.kt ───────────────────────────────────────────
-          cat > app/src/main/java/com/wallpaperapp/WallpaperWorker.kt << 'KOTLIN'
-          package com.wallpaperapp
-          import android.app.WallpaperManager
-          import android.content.Context
-          import android.graphics.Bitmap
-          import android.graphics.Canvas
-          import android.graphics.Color
-          import android.os.Handler
-          import android.os.Looper
-          import android.util.Log
-          import android.view.View
-          import android.webkit.*
-          import androidx.work.Worker
-          import androidx.work.WorkerParameters
-          import java.text.SimpleDateFormat
-          import java.util.*
-          import java.util.concurrent.CountDownLatch
-          import java.util.concurrent.TimeUnit
-          class WallpaperWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
-              override fun doWork(): Result {
-                  val prefs = applicationContext.getSharedPreferences("WallpaperPrefs", Context.MODE_PRIVATE)
-                  val url = prefs.getString("url", "https://www.google.com") ?: "https://www.google.com"
-                  val dm = applicationContext.resources.displayMetrics
-                  val width = dm.widthPixels; val height = dm.heightPixels
-                  val latch = CountDownLatch(1)
-                  var bitmap: Bitmap? = null
-                  Handler(Looper.getMainLooper()).post {
-                      try {
-                          val wv = WebView(applicationContext)
-                          wv.setBackgroundColor(Color.WHITE)
-                          wv.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; loadWithOverviewMode = true; useWideViewPort = true }
-                          wv.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
-                          wv.layout(0, 0, width, height)
-                          wv.webViewClient = object : WebViewClient() {
-                              override fun onPageFinished(view: WebView, url: String) {
-                                  view.postDelayed({
-                                      try {
-                                          val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                                          view.draw(Canvas(bmp)); bitmap = bmp
-                                      } catch (e: Exception) { Log.e("WW", "Screenshot failed", e) }
-                                      finally { latch.countDown() }
-                                  }, 4000)
-                              }
-                              override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) { if (req.isForMainFrame) latch.countDown() }
-                          }
-                          wv.loadUrl(url)
-                      } catch (e: Exception) { latch.countDown() }
-                  }
-                  if (!latch.await(60, TimeUnit.SECONDS) || bitmap == null) return Result.retry()
-                  return try {
-                      WallpaperManager.getInstance(applicationContext).setBitmap(bitmap)
-                      val ts = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.getDefault()).format(Date())
-                      prefs.edit().putString("last_updated", ts).apply()
-                      Result.success()
-                  } catch (e: Exception) { Result.failure() }
+              override fun onSupportNavigateUp(): Boolean {
+                  onBackPressedDispatcher.onBackPressed(); return true
               }
           }
-          KOTLIN
+          EOF
 
           # ── BootReceiver.kt ──────────────────────────────────────────────
-          cat > app/src/main/java/com/wallpaperapp/BootReceiver.kt << 'KOTLIN'
+          cat > app/src/main/java/com/wallpaperapp/BootReceiver.kt << 'EOF'
           package com.wallpaperapp
           import android.content.BroadcastReceiver
           import android.content.Context
@@ -203,20 +290,37 @@ jobs:
                   if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
                   val now = Calendar.getInstance()
                   val target = Calendar.getInstance().apply {
-                      set(Calendar.HOUR_OF_DAY, 1); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                      set(Calendar.HOUR_OF_DAY, 1); set(Calendar.MINUTE, 0)
+                      set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
                       if (!after(now)) add(Calendar.DAY_OF_YEAR, 1)
                   }
                   val req = PeriodicWorkRequestBuilder<WallpaperWorker>(24, TimeUnit.HOURS)
                       .setInitialDelay(target.timeInMillis - now.timeInMillis, TimeUnit.MILLISECONDS)
-                      .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                      .build()
-                  WorkManager.getInstance(context).enqueueUniquePeriodicWork("DailyWallpaper", ExistingPeriodicWorkPolicy.UPDATE, req)
+                      .setConstraints(
+                          Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
+                      ).build()
+                  WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                      "DailyWallpaper", ExistingPeriodicWorkPolicy.UPDATE, req
+                  )
               }
           }
-          KOTLIN
+          EOF
+
+          # ── activity_capture.xml (fullscreen invisible WebView) ──────────
+          cat > app/src/main/res/layout/activity_capture.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+              <WebView
+                  android:id="@+id/captureWebView"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent"/>
+          </FrameLayout>
+          EOF
 
           # ── activity_main.xml ────────────────────────────────────────────
-          cat > app/src/main/res/layout/activity_main.xml << 'XML'
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="match_parent" android:layout_height="match_parent"
@@ -249,10 +353,10 @@ jobs:
                   android:backgroundTint="#E0E0E0" android:textColor="#333333"/>
             </LinearLayout>
           </ScrollView>
-          XML
+          EOF
 
           # ── activity_settings.xml ────────────────────────────────────────
-          cat > app/src/main/res/layout/activity_settings.xml << 'XML'
+          cat > app/src/main/res/layout/activity_settings.xml << 'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
               android:layout_width="match_parent" android:layout_height="match_parent"
@@ -270,109 +374,6 @@ jobs:
                 android:text="💡 Dashboards, maps and news sites work great.\nMake sure the device has internet at 1 AM."
                 android:textSize="13sp" android:textColor="#888888" android:lineSpacingMultiplier="1.5"/>
           </LinearLayout>
-          XML
+          EOF
 
-          # ── Resource values ──────────────────────────────────────────────
-          cat > app/src/main/res/values/strings.xml << 'XML'
-          <resources><string name="app_name">Web Wallpaper</string></resources>
-          XML
-
-          cat > app/src/main/res/values/colors.xml << 'XML'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <color name="blue_primary">#1A73E8</color>
-              <color name="blue_dark">#1557B0</color>
-              <color name="white">#FFFFFFFF</color>
-              <color name="black">#FF000000</color>
-          </resources>
-          XML
-
-          cat > app/src/main/res/values/themes.xml << 'XML'
-          <resources>
-              <style name="Theme.WallpaperApp" parent="Theme.MaterialComponents.Light.DarkActionBar">
-                  <item name="colorPrimary">@color/blue_primary</item>
-                  <item name="colorPrimaryDark">@color/blue_dark</item>
-                  <item name="colorAccent">@color/blue_primary</item>
-              </style>
-          </resources>
-          XML
-
-          # ── Gradle files ─────────────────────────────────────────────────
-          cat > settings.gradle << 'GRADLE'
-          pluginManagement {
-              repositories { google(); mavenCentral(); gradlePluginPortal() }
-          }
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories { google(); mavenCentral() }
-          }
-          rootProject.name = "WallpaperApp"
-          include ':app'
-          GRADLE
-
-          cat > build.gradle << 'GRADLE'
-          plugins {
-              id 'com.android.application' version '8.2.2' apply false
-              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
-          }
-          GRADLE
-
-          cat > gradle.properties << 'PROPS'
-          org.gradle.jvmargs=-Xmx2048m
-          android.useAndroidX=true
-          kotlin.code.style=official
-          android.nonTransitiveRClass=true
-          PROPS
-
-          cat > app/build.gradle << 'GRADLE'
-          plugins {
-              id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
-          }
-          android {
-              namespace 'com.wallpaperapp'
-              compileSdk 34
-              defaultConfig {
-                  applicationId "com.wallpaperapp"
-                  minSdk 26
-                  targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
-              }
-              buildTypes {
-                  release { minifyEnabled false }
-              }
-              compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_1_8
-                  targetCompatibility JavaVersion.VERSION_1_8
-              }
-              kotlinOptions { jvmTarget = '1.8' }
-          }
-          dependencies {
-              implementation 'androidx.core:core-ktx:1.12.0'
-              implementation 'androidx.appcompat:appcompat:1.6.1'
-              implementation 'com.google.android.material:material:1.11.0'
-              implementation 'androidx.work:work-runtime-ktx:2.9.0'
-          }
-          GRADLE
-
-          cat > app/proguard-rules.pro << 'PRO'
-          -keep class com.wallpaperapp.** { *; }
-          PRO
-
-          echo "✅ All project files generated"
-
-      - name: Set up Gradle wrapper
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: '8.4'
-
-      - name: Build debug APK
-        run: gradle assembleDebug
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: WebWallpaper-debug
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
+          # ── String / color / theme resources ───────────────────
